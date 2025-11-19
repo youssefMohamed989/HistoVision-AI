@@ -1,0 +1,500 @@
+########################################################################
+# tissue_analysis_full_pipeline.R
+# Comprehensive Histology Analysis Toolkit (R)
+# - stain handling, segmentation, nuclei detection, features, spatial stats
+# - outputs CSVs, RDS, and an HTML report hook
+#
+# Usage: source("tissue_analysis_full_pipeline.R"); run_pipeline()
+########################################################################
+
+# -------------------------
+# Dependencies & install
+# -------------------------
+required_cran <- c(
+  "magick", "imager", "ggplot2", "dplyr", "tidyr", "patchwork", "scales",
+  "viridis", "RColorBrewer", "grid", "gridExtra", "ggforce", "glcm",
+  "spatstat.core", "spatstat.geom", "spatstat.explore", "igraph", "umap",
+  "dbscan", "Rtsne", "caret", "rmarkdown", "jsonlite"
+)
+# EBImage is Bioconductor
+bioc_pkgs <- c("EBImage")
+
+install_if_missing_cran <- function(pkgs){
+  to_install <- pkgs[!(pkgs %in% installed.packages()[, "Package"])]
+  if(length(to_install)) install.packages(to_install, repos = "https://cloud.r-project.org")
+}
+install_if_missing_cran(required_cran)
+
+if(!("EBImage" %in% installed.packages()[, "Package"])){
+  if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager", repos = "https://cloud.r-project.org")
+  BiocManager::install("EBImage", ask = FALSE)
+}
+
+# load
+library(magick)
+library(imager)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(patchwork)
+library(scales)
+library(viridis)
+library(RColorBrewer)
+library(grid)
+library(gridExtra)
+library(ggforce)
+library(EBImage)
+library(glcm)
+library(spatstat.core)
+library(spatstat.geom)
+library(spatstat.explore)
+library(igraph)
+library(umap)
+library(dbscan)
+library(Rtsne)
+library(caret)
+library(rmarkdown)
+library(jsonlite)
+
+set.seed(42)
+
+# -------------------------
+# Parameters
+# -------------------------
+params <- list(
+  img_path = "/mnt/data/tissue_analysis.png",
+  out_dir = "outputs",
+  micro_k = 4,
+  macro_k = 3,
+  organ_zones_k = 6,
+  block_size = 16,
+  smooth_sigma = 2,
+  max_plot_points = 200000 # downsample for plotting
+)
+
+dir.create(params$out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# -------------------------
+# Utilities
+# -------------------------
+# safe read to EBImage, magick, imager
+read_image_any <- function(path){
+  img <- image_read(path)
+  # convert to EBImage (Image) and also imager (cimg) if needed
+  # EBImage::readImage can read file directly, but use magick for consistency
+  # convert magick->raster->Image
+  tmpfile <- tempfile(fileext = ".png")
+  image_write(img, path = tmpfile, format = "png")
+  eb <- EBImage::readImage(tmpfile)
+  cimg <- magick2cimg(img)
+  list(magick = img, eb = eb, cimg = cimg)
+}
+
+# optical density transform for stain separation
+rgb_to_od <- function(rgb){
+  # rgb: matrix n x 3 with 0..1 values
+  rgb[rgb == 0] <- 1e-6
+  od <- -log(rgb)
+  od
+}
+
+# estimate stain matrix using kmeans on OD (rough)
+estimate_stain_matrix <- function(img_eb, nstains = 2){
+  # img_eb is EBImage Image with 3 channels, values 0..1
+  rgb <- as.array(img_eb)
+  dims <- dim(rgb)
+  # reshape to n x 3
+  mat <- matrix(NA, nrow = dims[1]*dims[2], ncol = 3)
+  idx <- 1
+  for(i in 1:dims[1]){
+    for(j in 1:dims[2]){
+      mat[idx, ] <- rgb[i, j, ]
+      idx <- idx + 1
+    }
+  }
+  od <- rgb_to_od(mat)
+  # use kmeans on OD to get stain vectors (this is a heuristic)
+  km <- kmeans(od, centers = nstains, iter.max = 50, nstart = 5)
+  centers <- km$centers
+  # normalize columns (stain vectors)
+  sv <- t(apply(centers, 1, function(x) x / sqrt(sum(x^2))))
+  return(sv)
+}
+
+# color deconvolution: project OD onto stain matrix and reconstruct per-stain image
+color_deconvolution <- function(img_eb, stain_matrix){
+  rgb <- as.array(img_eb)
+  dims <- dim(rgb)
+  mat <- matrix(NA, nrow = dims[1]*dims[2], ncol = 3)
+  idx <- 1
+  for(i in 1:dims[1]){
+    for(j in 1:dims[2]){
+      mat[idx, ] <- rgb[i, j, ]
+      idx <- idx + 1
+    }
+  }
+  od <- rgb_to_od(mat)
+  # project onto stain matrix (least squares)
+  beta <- od %*% t(solve(stain_matrix %*% t(stain_matrix)) %*% stain_matrix)
+  # beta is n x stains: amount of each stain per pixel
+  list(beta = beta, dims = dims)
+}
+
+# stain normalization: Macenko style (simplified)
+stain_normalize_macenko <- function(img_eb, ref_stain=NULL){
+  # simplified approach: match OD percentiles to reference.
+  # For production use: replace with a robust Macenko implementation (python or R package).
+  message("Performing simplified stain normalization (percentile matching)")
+  rgb <- as.array(img_eb)
+  dims <- dim(rgb)
+  mat <- matrix(NA, nrow = dims[1]*dims[2], ncol = 3)
+  idx <- 1
+  for(i in 1:dims[1]){
+    for(j in 1:dims[2]){
+      mat[idx, ] <- rgb[i, j, ]
+      idx <- idx + 1
+    }
+  }
+  # percentiles per channel
+  p_src <- apply(mat, 2, function(x) quantile(x, probs = c(0.01, 0.99)))
+  if(is.null(ref_stain)){
+    ref_stain <- p_src
+  }
+  # linear rescale each channel to match reference percentile range
+  mat_norm <- mat
+  for(ch in 1:3){
+    a_src <- p_src[1, ch]; b_src <- p_src[2, ch]
+    a_ref <- ref_stain[1, ch]; b_ref <- ref_stain[2, ch]
+    # avoid divide by zero
+    if(abs(b_src - a_src) < 1e-6) next
+    mat_norm[, ch] <- pmin(pmax((mat[, ch] - a_src) / (b_src - a_src), 0), 1)
+    mat_norm[, ch] <- mat_norm[, ch] * (b_ref - a_ref) + a_ref
+  }
+  # put back to Image
+  img_norm <- img_eb
+  idx <- 1
+  for(i in 1:dims[1]){
+    for(j in 1:dims[2]){
+      img_norm[i, j, ] <- mat_norm[idx, ]
+      idx <- idx + 1
+    }
+  }
+  img_norm
+}
+
+# -------------------------
+# Core analysis functions
+# -------------------------
+
+# 1) Quality control (brightness, contrast, artifacts)
+qc_image <- function(img_eb){
+  rgb <- as.array(img_eb)
+  mins <- apply(rgb, 3, min)
+  maxs <- apply(rgb, 3, max)
+  means <- apply(rgb, 3, mean)
+  sd <- apply(rgb, 3, sd)
+  list(mins = mins, maxs = maxs, means = means, sd = sd)
+}
+
+# 2) Tissue segmentation (fast heuristics)
+segment_tissue <- function(img_eb, method = c("otsu", "adaptive", "color_threshold")){
+  method <- match.arg(method)
+  gray <- channel(img_eb, "gray")
+  m <- as.matrix(gray)
+  if(method == "otsu"){
+    th <- otsu(m)
+    mask <- m < th  # toggle depending on stain
+  } else if(method == "adaptive"){
+    # local threshold via running mean: EBImage::thresh
+    mask <- thresh(gray, w = 15, h = 15, offset = 0.05)
+  } else {
+    # color threshold in HSV: detect high saturation (tissue) vs white background
+    rgb <- as.array(img_eb)
+    # convert to HSV using EBImage::rgb2hsv
+    hsv <- apply(rgb, c(1,2), function(px) rgb2hsv(px[1], px[2], px[3]))
+    sat <- matrix(hsv["s", , ], nrow = dim(rgb)[1], ncol = dim(rgb)[2])
+    mask <- sat > 0.1
+  }
+  # morphological cleanup
+  mask <- opening(fillHull(as.Image(mask)), makeBrush(5, shape = "disc"))
+  mask <- bwlabel(mask) > 0
+  mask
+}
+
+# Otsu helper (EBImage has otsu thresholding via 'otsu')
+otsu <- function(mat){
+  # expects values 0..1
+  as.numeric(EBImage::otsu(as.Image(mat)))
+}
+
+# 3) Nuclei detection (watershed)
+detect_nuclei <- function(img_eb, tissue_mask = NULL, method = c("watershed","simple_thresh")){
+  method <- match.arg(method)
+  # convert to grayscale or hematoxylin channel if deconvolved
+  gray <- channel(img_eb, "gray")
+  # smooth
+  gblur <- gblur(gray, sigma = 1)
+  # adaptive threshold
+  th <- thresh(gblur, w = 15, h = 15, offset = 0.02)
+  # restrict to tissue region if provided
+  if(!is.null(tissue_mask)){
+    th <- th * tissue_mask
+  }
+  # distance transform
+  d <- distmap(fillHull(th))
+  # find maxima as markers
+  maxima <- watershed(-d, tolerance = 1, ext = 1)
+  # segmentation
+  segments <- watershed(-d, tolerance = 1)
+  # alternative marker-controlled watershed using opening and peaks
+  labelled <- bwlabel(segments)
+  # compute features
+  feats <- computeFeatures.shape(labelled)
+  feats_m <- as.data.frame(feats)
+  feats_m$label <- as.integer(rownames(feats_m))
+  list(labelled = labelled, features = feats_m)
+}
+
+# 4) Cell / object features
+extract_cell_features <- function(labelled_img, original_img){
+  # labelled_img is an Image (integer labels)
+  shape <- computeFeatures.shape(labelled_img)
+  moment <- computeFeatures.moment(labelled_img)
+  basic <- computeFeatures.basic(labelled_img, original_img)
+  # merge into single df keyed by label
+  df <- as.data.frame(shape)
+  df$label <- rownames(df)
+  df <- df %>% left_join(as.data.frame(moment) %>% mutate(label = rownames(.)), by = "label")
+  df <- df %>% left_join(as.data.frame(basic) %>% mutate(label = rownames(.)), by = "label")
+  rownames(df) <- NULL
+  df
+}
+
+# 5) Texture & glcm features (Haralick)
+compute_glcm_features <- function(gray_mat, window = 21, shift = 1, angles = c(0, pi/4, pi/2, 3*pi/4)){
+  # glcm package works on matrices; compute global GLCM features on image tile windows
+  # For speed, compute per tile, aggregate by mean/std
+  w <- nrow(gray_mat); h <- ncol(gray_mat)
+  stride <- window
+  feats_list <- list()
+  idx <- 1
+  for(x in seq(1, w-window+1, by = stride)){
+    for(y in seq(1, h-window+1, by = stride)){
+      tile <- gray_mat[x:(x+window-1), y:(y+window-1)]
+      g <- glcm(tile, angle = angles, d = shift, n_grey = 32)
+      # g is an array; compute Haralick stats (glcm package returns some precomputed features)
+      s <- as.numeric(unlist(lapply(g, function(x) mean(x, na.rm = TRUE))))
+      feats_list[[idx]] <- s
+      idx <- idx + 1
+    }
+  }
+  feats_mat <- do.call(rbind, feats_list)
+  colMeans(feats_mat, na.rm = TRUE)
+}
+
+# 6) Gradient / architectural complexity & fractal dimension
+compute_gradient_features <- function(img_cimg){
+  gx <- imgradient(img_cimg, "x")
+  gy <- imgradient(img_cimg, "y")
+  grad <- sqrt(gx^2 + gy^2)
+  list(grad = grad, mean_grad = mean(as.vector(grad)))
+}
+
+# fractal dimension (box-counting) on binary mask
+fractal_boxcount <- function(bin_mat, min_box=2){
+  # bin_mat: logical matrix
+  sizes <- floor(2^seq(floor(log2(min(dim(bin_mat)))),
+                       -1, length.out = 8))
+  Ns <- sapply(sizes, function(s){
+    # pad to multiple
+    nr <- nrow(bin_mat); nc <- ncol(bin_mat)
+    nr2 <- ceiling(nr / s) * s; nc2 <- ceiling(nc / s) * s
+    mat <- matrix(0, nrow = nr2, ncol = nc2)
+    mat[1:nr, 1:nc] <- bin_mat
+    # reshape blocks
+    blocks <- array(mat, dim = c(s, nr2/s, s, nc2/s))
+    # count blocks with any '1'
+    nblocks <- sum(apply(blocks, c(2,4), function(bl) any(bl)))
+    nblocks
+  })
+  # linear fit log(Ns) ~ log(1/size)
+  fit <- lm(log(Ns) ~ log(1/sizes))
+  -coef(fit)[2]
+}
+
+# 7) Spatial Stats (Ripley K, nearest neighbor distribution, Moran's I)
+spatial_stats_pointpattern <- function(xy_df, window = NULL){
+  # xy_df: data.frame with x,y coords of cells of interest
+  if(is.null(window)){
+    window <- owin(range(xy_df$x), range(xy_df$y))
+  }
+  pp <- ppp(xy_df$x, xy_df$y, window = window)
+  K <- Kest(pp, correction = "border")
+  G <- Gest(pp)
+  model <- list(K = K, G = G)
+  model
+}
+
+# Moran's I for intensity variable in raster-like points
+compute_morans_I <- function(coords_df, value_col = "value", nb_k = 6){
+  require(spdep)
+  coords <- as.matrix(coords_df[, c("x", "y")])
+  knn <- spdep::knearneigh(coords, k = nb_k)
+  nb <- spdep::knn2nb(knn)
+  lw <- spdep::nb2listw(nb, style = "W")
+  vali <- coords_df[[value_col]]
+  mi <- spdep::moran.test(vali, lw, zero.policy = TRUE)
+  mi
+}
+
+# 8) Cell graph & community detection
+cell_graph_from_coords <- function(coords_df, radius = 20){
+  # build graph where edges between cells within radius
+  coords <- as.matrix(coords_df[, c("x", "y")])
+  dmat <- as.matrix(dist(coords))
+  adj <- dmat <= radius & dmat > 0
+  g <- graph_from_adjacency_matrix(adj, mode = "undirected", diag = FALSE)
+  # community detection (Louvain)
+  comm <- cluster_louvain(g)
+  list(graph = g, community = comm)
+}
+
+# 9) Clustering & dimensionality reduction for phenotyping
+cluster_cells <- function(feature_df, method = c("kmeans","dbscan","hdbscan"), k = 6){
+  method <- match.arg(method)
+  feats <- feature_df %>% select_if(is.numeric) %>% scale()
+  if(method == "kmeans"){
+    km <- kmeans(feats, centers = k, nstart = 10)
+    return(km$cluster)
+  } else if(method == "dbscan"){
+    ds <- dbscan::dbscan(feats, eps = 0.5, minPts = 5)
+    return(ds$cluster)
+  }
+}
+
+# -------------------------
+# Orchestrator: run pipeline
+# -------------------------
+run_pipeline <- function(params = params){
+  cat("Loading image...\n")
+  imgs <- read_image_any(params$img_path)
+  eb <- imgs$eb
+  cimg <- imgs$cimg
+  mag <- imgs$magick
+
+  # QC
+  qc <- qc_image(eb)
+  saveRDS(qc, file.path(params$out_dir, "qc.rds"))
+  cat("QC summary:", toJSON(qc, pretty = TRUE), "\n")
+
+  # Stain normalization (optional)
+  eb_norm <- stain_normalize_macenko(eb)
+
+  # Tissue segmentation
+  tissue_mask <- segment_tissue(eb_norm, method = "adaptive")
+  writeImage(tissue_mask, file.path(params$out_dir, "tissue_mask.png"))
+  cat("Saved tissue mask\n")
+
+  # Stain deconvolution estimate 2 stains (H and E typically)
+  stain_mat <- estimate_stain_matrix(eb_norm, nstains = 2)
+  deconv <- color_deconvolution(eb_norm, stain_mat)
+  # deconv$beta contains per-pixel stain amounts - can be reshaped back
+  saveRDS(list(stain_mat = stain_mat), file.path(params$out_dir, "stain_info.rds"))
+
+  # Nuclei detection
+  nuc <- detect_nuclei(eb_norm, tissue_mask = tissue_mask, method = "watershed")
+  writeImage(colorLabels(nuc$labelled), file.path(params$out_dir, "nuclei_labels.png"))
+  cat("Detected nuclei:", nrow(nuc$features), "\n")
+  write.csv(nuc$features, file.path(params$out_dir, "nuclei_features.csv"), row.names = FALSE)
+
+  # Cell features
+  feats <- extract_cell_features(nuc$labelled, eb_norm)
+  write.csv(feats, file.path(params$out_dir, "cell_features.csv"), row.names = FALSE)
+
+  # Texture features (global)
+  gray_mat <- as.matrix(channel(eb_norm, "gray"))
+  glcm_feats <- compute_glcm_features(gray_mat, window = 21)
+  saveRDS(glcm_feats, file.path(params$out_dir, "glcm_features.rds"))
+
+  # Gradient and fractal
+  grad_res <- compute_gradient_features(cimg)
+  saveRDS(grad_res, file.path(params$out_dir, "gradient.rds"))
+  # fractal dimension on tissue mask
+  mask_mat <- as.matrix(tissue_mask)
+  fd <- fractal_boxcount(mask_mat)
+  cat("Fractal dimension:", fd, "\n")
+
+  # Spatial stats on nuclei centroids
+  # get centroids from features
+  if("m.cx" %in% colnames(nuc$features)){
+    centroids <- data.frame(x = nuc$features$m.cx, y = nuc$features$m.cy)
+  } else {
+    # fallback: compute centroids from computeFeatures.moment
+    mom <- computeFeatures.moment(nuc$labelled)
+    centroids <- data.frame(x = mom[ , "m.cx"], y = mom[ , "m.cy"])
+  }
+  spat <- spatial_stats_pointpattern(centroids)
+  saveRDS(spat, file.path(params$out_dir, "spatial_stats.rds"))
+
+  # Moran's I on progression-like metric: here we use intensity
+  coords_df <- data.frame(x = rep(1:nrow(gray_mat), each = ncol(gray_mat)),
+                          y = rep(ncol(gray_mat):1, times = nrow(gray_mat)),
+                          value = as.vector(gray_mat))
+  moran <- tryCatch(compute_morans_I(coords_df %>% sample_n(min(5000, nrow(coords_df))), value_col = "value"),
+                    error = function(e) e)
+  saveRDS(moran, file.path(params$out_dir, "moranI.rds"))
+
+  # Build cell graph
+  cg <- cell_graph_from_coords(centroids, radius = 30)
+  saveRDS(cg, file.path(params$out_dir, "cell_graph.rds"))
+
+  # Cluster cells for phenotyping
+  # use some numeric features from feats
+  feat_df <- feats %>% select(contains("s.area"), contains("s.radius"), contains("s.perimeter"), contains("s.radius.mean"))
+  # safe fallback if empty
+  if(ncol(feat_df) < 1) feat_df <- feats %>% select_if(is.numeric)
+  clusters <- cluster_cells(feat_df, method = "kmeans", k = params$micro_k)
+  feats$cluster <- clusters
+  write.csv(feats, file.path(params$out_dir, "cell_clusters.csv"), row.names = FALSE)
+
+  # UMAP embedding for visualization
+  um <- umap::umap(scale(feat_df %>% replace(is.na(.), 0)))
+  um_df <- data.frame(um$layout)
+  colnames(um_df) <- c("UMAP1", "UMAP2")
+  um_df$cluster <- as.factor(clusters)
+  write.csv(um_df, file.path(params$out_dir, "umap_cells.csv"), row.names = FALSE)
+
+  # Compose outputs (summary)
+  summary <- list(
+    qc = qc,
+    num_nuclei = nrow(nuc$features),
+    fractal_dim = fd,
+    glcm = glcm_feats,
+    gradient_mean = grad_res$mean_grad
+  )
+  saveRDS(summary, file.path(params$out_dir, "summary.rds"))
+  write(jsonlite::toJSON(summary, pretty = TRUE, auto_unbox = TRUE),
+        file.path(params$out_dir, "summary.json"))
+
+  # Save big objects for downstream modeling
+  saveRDS(list(eb = eb_norm, tissue_mask = tissue_mask, nuclei = nuc, cell_features = feats),
+          file.path(params$out_dir, "processed_objects.rds"))
+
+  # Small plotting: intensity, mask, nuclei overlay, progression heatmap placeholder
+  p1 <- ggplot() +
+    annotation_raster(as.raster(EBImage::imageData(eb_norm)), xmin = 0, xmax = nrow(EBImage::imageData(eb_norm)),
+                      ymin = 0, ymax = ncol(EBImage::imageData(eb_norm))) + ggtitle("Normalized Image")
+  png(file.path(params$out_dir, "overview_plot.png"), width = 1200, height = 800)
+  print(p1)
+  dev.off()
+
+  cat("Pipeline finished. Outputs are in:", params$out_dir, "\n")
+}
+
+# If script is run interactively, run pipeline
+if(interactive()){
+  run_pipeline(params)
+}
+
+# End of script
