@@ -36,7 +36,7 @@ The pipeline is modular, allowing you to plug in additional analysis steps or vi
 
 ---
 
-## Installation
+Installation
 
 ### 1. Clone repository
 
